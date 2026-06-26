@@ -29,6 +29,8 @@ const server = Bun.serve({
             const { id, sheet: sheetParam } = request.params;
             const url = new URL(request.url);
 
+            console.log(`[request] ${request.method} ${request.url}`);
+
             // Random cache duration between 30-60 seconds to prevent cache stampedes
             const cacheDuration = Math.floor(Math.random() * 31) + 30; // 30 to 60 seconds
             const HEADERS = {
@@ -37,13 +39,18 @@ const server = Bun.serve({
             };
 
             const queryParams = Object.fromEntries(url.searchParams.entries());
+            console.log(
+                `[params] id=${id}, sheet=${sheetParam}, queryParams=${JSON.stringify(queryParams)}`,
+            );
 
             // This prevents use of extra query parameters like ?v= to bust the cache early.
-            if (
-                Object.keys(queryParams).some(
-                    (key) => !(key in ALLOWED_QUERY_PARAMETERS),
-                )
-            ) {
+            const invalidKeys = Object.keys(queryParams).filter(
+                (key) => !(key in ALLOWED_QUERY_PARAMETERS),
+            );
+            if (invalidKeys.length > 0) {
+                console.log(
+                    `[validation] rejected: invalid query params ${invalidKeys.join(", ")}`,
+                );
                 return error(
                     `Invalid query parameters. Allowed parameters: ${Object.keys(
                         ALLOWED_QUERY_PARAMETERS,
@@ -59,6 +66,9 @@ const server = Bun.serve({
                 if (key in ALLOWED_QUERY_PARAMETERS) {
                     const allowedValues = ALLOWED_QUERY_PARAMETERS[key];
                     if (!allowedValues.includes(value)) {
+                        console.log(
+                            `[validation] rejected: invalid value for param ${key}=${value}`,
+                        );
                         return error(
                             `Invalid value for query parameter \`${key}\``,
                             400,
@@ -68,31 +78,44 @@ const server = Bun.serve({
             }
 
             const useUnformattedValues = queryParams.raw === "true";
+            console.log(
+                `[option] useUnformattedValues=${useUnformattedValues}`,
+            );
 
             const cacheKey = request.url;
 
             const cachedResponse = await redis.get(cacheKey);
             if (cachedResponse) {
+                console.log(`[cache] HIT for key=${cacheKey}`);
                 return new Response(cachedResponse, {
                     headers: HEADERS,
                 });
             }
+            console.log(`[cache] MISS for key=${cacheKey}`);
 
             // Check if there's already a pending request for this cache key
             // This prevents multiple simultaneous requests from all hitting the Google API
             if (pendingRequests.has(cacheKey)) {
+                console.log(`[pending] coalescing request for key=${cacheKey}`);
                 try {
                     const responseData = await pendingRequests.get(cacheKey)!;
+                    console.log(
+                        `[pending] resolved coalesced request for key=${cacheKey}`,
+                    );
                     return new Response(responseData, {
                         headers: HEADERS,
                     });
                 } catch (e) {
+                    console.log(
+                        `[pending] coalesced request failed: ${e instanceof Error ? e.message : String(e)}`,
+                    );
                     return error(e instanceof Error ? e.message : String(e));
                 }
             }
 
             // Create a promise for fetching this data and store it
             const fetchPromise = (async () => {
+                console.log(`[fetch] starting Google Sheets API fetch`);
                 try {
                     if (Math.random() < 0.01) {
                         const now = new Date();
@@ -137,9 +160,18 @@ const server = Bun.serve({
                             ).json();
 
                             if (sheetData.error) {
+                                console.log(
+                                    `[google] metadata API error: ${sheetData.error.message}`,
+                                );
                                 throw new Error(sheetData.error.message);
                             }
+                            console.log(
+                                `[google] fetched metadata for spreadsheet ${id}`,
+                            );
 
+                            console.log(
+                                `[cache] storing metadata under key=${metadataCacheKey}`,
+                            );
                             await redis.set(
                                 metadataCacheKey,
                                 JSON.stringify(sheetData),
@@ -171,16 +203,26 @@ const server = Bun.serve({
                             "UNFORMATTED_VALUE",
                         );
 
+                    console.log(
+                        `[google] fetching sheet values for sheet="${sheet}"`,
+                    );
                     const result = await (await fetch(apiUrl)).json();
 
                     if (result.error) {
+                        console.log(
+                            `[google] values API error: ${result.error.message}`,
+                        );
                         throw new Error(result.error.message);
                     }
 
                     const rows: any[] = [];
 
                     const rawRows = result.values || [];
+                    console.log(
+                        `[data] ${rawRows.length} rows returned (including header)`,
+                    );
                     const headers = rawRows.shift();
+                    console.log(`[data] headers: ${headers?.join(", ")}`);
 
                     rawRows.forEach((row: any[]) => {
                         const rowData: any = {};
@@ -191,9 +233,15 @@ const server = Bun.serve({
                     });
 
                     const responseData = JSON.stringify(rows);
+                    console.log(
+                        `[data] response size: ${responseData.length} bytes`,
+                    );
 
                     await redis.set(cacheKey, responseData);
                     await redis.expire(cacheKey, cacheDuration);
+                    console.log(
+                        `[cache] stored response under key=${cacheKey}, TTL=${cacheDuration}s`,
+                    );
 
                     return responseData;
                 } finally {
@@ -206,10 +254,14 @@ const server = Bun.serve({
 
             try {
                 const responseData = await fetchPromise;
+                console.log(`[response] successful, returning 200`);
                 return new Response(responseData, {
                     headers: HEADERS,
                 });
             } catch (e) {
+                console.log(
+                    `[response] failed: ${e instanceof Error ? e.message : String(e)}`,
+                );
                 return error(e instanceof Error ? e.message : String(e));
             }
         },
@@ -219,10 +271,10 @@ const server = Bun.serve({
     },
 });
 
-console.log(`Server running on http://localhost:${server.port}`);
+console.log(`[startup] Server running on http://localhost:${server.port}`);
 
 const error = (message: string, status = 400) => {
-    console.log(status, message);
+    console.log(`[error] status=${status}, message="${message}"`);
     return new Response(
         JSON.stringify({
             error: message,
